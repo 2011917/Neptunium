@@ -1,10 +1,37 @@
-# Python-generated files
+# --- Python & Environments ---
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
 build/
 dist/
-wheels/
-*.egg-info
+*.egg-info/
 
-# Virtual environments
-.venv
+# --- AI Models (Crucial for avoiding 500 errors) ---
+# This blocks all large binary model formats
+*.gguf
+*.bin
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# --- Windows & Library Files ---
+# This blocks the DLLs and Libs you saw in your folder
+*.dll
+*.lib
+*.pdb
+*.exe
+*.msi
+
+# --- VS Code & IDEs ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- Project Specific ---
+# If you have a folder specifically for models, you can block the whole folder:
+# models/
