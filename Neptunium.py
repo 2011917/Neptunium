@@ -38,7 +38,7 @@ class TheUIForAI(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        def load_model(llm_path="Llama-3.2-3B-Instruct-Q4_K_M.gguf"):
+        def load_model(llm_path="Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"):
             try:
                 self.llm = Llama(
                     model_path=resource_path(llm_path),
