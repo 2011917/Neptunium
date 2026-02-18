@@ -1,5 +1,4 @@
 import os
-import sys
 import threading
 import psutil
 import platform
@@ -7,34 +6,24 @@ import customtkinter as ctk
 from tkinter import filedialog
 from llama_cpp import Llama
 import fitz  # PyMuPDF
-from PIL import Image
 
 class HardwareEngine:
-    """Detects system specs and recommends LLM parameters"""
     @staticmethod
     def get_specs():
         ram_gb = round(psutil.virtual_memory().total / (1024**3))
-        cores = os.cpu_count()
+        cores = os.cpu_count() or 4
         is_mac = platform.system() == "Darwin"
-        is_arm = "arm" in platform.machine().lower()
         
-        # Adjust logic based on RAM
-        if ram_gb <= 8:
-            ctx_limit = 2048  # Low RAM: keep context small
-            offload = 10 if not is_mac else -1 # Partial offload for low-end
-        elif ram_gb <= 16:
-            ctx_limit = 4096
-            offload = -1 # Try full offload
-        else:
-            ctx_limit = 8192 # High-end
-            offload = -1
-
+        # Heuristic for local LLM settings
+        ctx_limit = 4096 if ram_gb > 8 else 2048
+        offload = -1 if ram_gb > 12 else 0 # -1 uses all GPU layers if available
+        
         return {
             "ram": ram_gb,
-            "cores": max(cores - 2, 1), # Leave some cores for the OS
+            "cores": max(cores - 2, 1),
             "ctx": ctx_limit,
             "offload": offload,
-            "desc": f"{platform.system()} | {ram_gb}GB RAM | {cores} Cores"
+            "desc": f"{platform.system()} | {ram_gb}GB RAM"
         }
 
 class ChatMessage(ctk.CTkFrame):
@@ -44,9 +33,8 @@ class ChatMessage(ctk.CTkFrame):
         bg_color = "#2b5ff1" if is_user else "#333333"
         
         self.textbox = ctk.CTkTextbox(
-            self, width=550, fg_color=bg_color, text_color="white",
-            font=("Segoe UI", 13), corner_radius=12, wrap="word",
-            padx=12, pady=12, border_width=0
+            self, width=500, fg_color=bg_color, text_color="white",
+            font=("Segoe UI", 13), corner_radius=15, wrap="word", padx=10, pady=10
         )
         self.textbox.insert("0.0", text)
         self.textbox.configure(state="disabled")
@@ -54,65 +42,137 @@ class ChatMessage(ctk.CTkFrame):
         self.update_height()
 
     def update_height(self):
-        self.update_idletasks()
-        content = self.textbox.get("0.0", "end")
-        lines = content.count("\n") + (len(content) // 65) + 1
-        self.textbox.configure(height=min(max(lines * 22, 45), 800))
+        text = self.textbox.get("0.0", "end")
+        lines = text.count("\n") + (len(text) // 60) + 1
+        self.textbox.configure(height=min(max(lines * 22, 45), 600))
 
 class NeptuniumAI(ctk.CTk):
     def __init__(self):
         super().__init__()
+        self.title("Neptunium AI")
+        self.geometry("900x750")
+        
+        self.specs = HardwareEngine.get_specs()
+        self.history = []
+        self.pending_context = ""
+        self.llm = None
 
-        def load_model(llm_path="Llama-3.2-3B-Instruct-Q4_K_M.gguf"):
-            try:
-                self.llm = Llama(
-                    model_path=model_name,
-                    n_gpu_layers=self.specs["offload"],
-                    n_threads=self.specs["cores"],
-                    n_ctx=self.specs["ctx"],
-                    flash_attn=True,
-                    verbose=False
-                )
-            except Exception as e: print(f"Load error: {e}")
-            self.after(0, lambda: self.submit_btn.configure(state="normal", text="Send"))
-        threading.Thread(target=load, daemon=True).start()
+        # --- Top Bar (Model Selection) ---
+        self.top_bar = ctk.CTkFrame(self, height=50, fg_color="transparent")
+        self.top_bar.pack(fill="x", padx=20, pady=10)
+        
+        self.model_label = ctk.CTkLabel(self.top_bar, text="Model:", font=("Segoe UI", 12, "bold"))
+        self.model_label.pack(side="left", padx=(0, 10))
+        
+        self.model_dropdown = ctk.CTkOptionMenu(self.top_bar, values=["Scanning..."], command=self.switch_model)
+        self.model_dropdown.pack(side="left")
+        
+        self.status_indicator = ctk.CTkLabel(self.top_bar, text="● Offline", text_color="gray")
+        self.status_indicator.pack(side="right")
+
+        # --- Chat Area ---
+        self.chat_container = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.chat_container.pack(fill="both", expand=True, padx=20, pady=10)
+
+        # --- Attachment Preview ---
+        self.file_pill = ctk.CTkLabel(self, text="", text_color="#3498db", font=("Segoe UI", 11, "italic"))
+        self.file_pill.pack(pady=0)
+
+        # --- Input Bar (Gemini Style) ---
+        self.input_container = ctk.CTkFrame(self, corner_radius=25, fg_color="#252525", border_width=1, border_color="#444")
+        self.input_container.pack(fill="x", padx=30, pady=(0, 20))
+
+        self.attach_btn = ctk.CTkButton(self.input_container, text="+", width=40, height=40, 
+                                       corner_radius=20, fg_color="#333", hover_color="#444", 
+                                       command=self.upload_handler)
+        self.attach_btn.pack(side="left", padx=10, pady=5)
+
+        self.input_box = ctk.CTkEntry(self.input_container, placeholder_text="Ask anything...", 
+                                     border_width=0, fg_color="transparent", height=40)
+        self.input_box.pack(side="left", fill="x", expand=True, padx=5)
+        self.input_box.bind("<Return>", lambda e: self.start_generation())
+
+        self.submit_btn = ctk.CTkButton(self.input_container, text="Send", width=80, height=34, 
+                                       corner_radius=17, command=self.start_generation, state="disabled")
+        self.submit_btn.pack(side="right", padx=10)
+
+        # Initialize
+        self.refresh_models()
+
+    def refresh_models(self):
+        models = [f for f in os.listdir(".") if f.endswith(".gguf")]
+        if not models:
+            self.model_dropdown.configure(values=["No .gguf files found"])
+        else:
+            self.model_dropdown.configure(values=models)
+            self.model_dropdown.set(models[0])
+            self.switch_model(models[0])
+
+    def switch_model(self, model_name):
+        self.status_indicator.configure(text="○ Loading...", text_color="yellow")
+        self.submit_btn.configure(state="disabled")
+        threading.Thread(target=self._load_engine, args=(model_name,), daemon=True).start()
+
+    def _load_engine(self, model_name):
+        try:
+            # Clean up old model if exists
+            if self.llm: del self.llm
+            
+            self.llm = Llama(
+                model_path=model_name,
+                n_gpu_layers=self.specs["offload"],
+                n_threads=self.specs["cores"],
+                n_ctx=self.specs["ctx"],
+                verbose=False
+            )
+            self.after(0, lambda: self.status_indicator.configure(text="● Ready", text_color="#4CAF50"))
+            self.after(0, lambda: self.submit_btn.configure(state="normal"))
+        except Exception as e:
+            self.after(0, lambda: self.status_indicator.configure(text="● Error", text_color="red"))
+            print(f"Engine Error: {e}")
 
     def upload_handler(self):
-        path = filedialog.askopenfilename(filetypes=[("All Files", "*.txt *.pdf *.png *.jpg")])
+        path = filedialog.askopenfilename(filetypes=[("Documents", "*.txt *.pdf")])
         if not path: return
+        
         ext = os.path.splitext(path)[1].lower()
-        if ext in [".png", ".jpg", ".jpeg"]:
-            self.current_context = f"\n[User Image: {os.path.basename(path)}]\n"
-            self.file_status.configure(text=f"Image Linked", text_color="#3498db")
-        elif ext == ".pdf":
-            text = "".join([p.get_text() for p in fitz.open(path)])
-            self.current_context = f"\n[Document: {text[:self.specs['ctx']]}]\n"
-            self.file_status.configure(text="PDF Context Active", text_color="#4CAF50")
-        else:
-            with open(path, "r", encoding="utf-8") as f:
-                self.current_context = f"\n[Text Data: {f.read()[:self.specs['ctx']]}]\n"
-            self.file_status.configure(text="Text Context Active", text_color="#4CAF50")
+        filename = os.path.basename(path)
+        
+        try:
+            if ext == ".pdf":
+                doc = fitz.open(path)
+                content = "\n".join([page.get_text() for page in doc])
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
 
-    def add_message(self, role, text):
-        msg = ChatMessage(self.chat_container, role, text)
-        msg.pack(fill="x", padx=15, pady=8)
-        self.messages.append(msg)
-        self.after(50, lambda: self.chat_container._parent_canvas.yview_moveto(1.0))
-        return msg
+            # Limit context to avoid crashing small models
+            char_limit = self.specs["ctx"] * 3 
+            self.pending_context = f"\n[Document Content: {filename}]\n{content[:char_limit]}\n[End of Document]\n"
+            self.file_pill.configure(text=f"📎 {filename} attached")
+        except Exception as e:
+            self.file_pill.configure(text=f"❌ Error loading file: {e}")
 
     def start_generation(self):
         query = self.input_box.get().strip()
         if not query or not self.llm: return
+        
         self.add_message("user", query)
         self.input_box.delete(0, "end")
         self.submit_btn.configure(state="disabled")
-        prompt = self.current_context + query
-        self.history.append({"role": "user", "content": prompt})
-        self.current_context = "" 
+        
+        # Inject file context if it exists
+        full_prompt = f"{self.pending_context}\nQuestion: {query}" if self.pending_context else query
+        self.history.append({"role": "user", "content": full_prompt})
+        
+        # Clear UI file indicator and internal buffer
+        self.pending_context = ""
+        self.file_pill.configure(text="")
+        
         threading.Thread(target=self.generate_response, daemon=True).start()
 
     def generate_response(self):
-        ai_msg = self.add_message("assistant", "Thinking...")
+        ai_msg = self.add_message("assistant", "...")
         full_txt = ""
         try:
             stream = self.llm.create_chat_completion(messages=self.history, stream=True)
@@ -123,9 +183,15 @@ class NeptuniumAI(ctk.CTk):
                     self.after(0, lambda t=full_txt: self.update_ai_bubble(ai_msg, t))
             self.history.append({"role": "assistant", "content": full_txt})
         except Exception as e:
-            self.after(0, lambda: ai_msg.textbox.configure(state="normal"))
-            self.after(0, lambda: ai_msg.textbox.insert("end", f"\nError: {e}"))
+            self.after(0, lambda: self.update_ai_bubble(ai_msg, f"Generation Error: {e}"))
+        
         self.after(0, lambda: self.submit_btn.configure(state="normal"))
+
+    def add_message(self, role, text):
+        msg = ChatMessage(self.chat_container, role, text)
+        msg.pack(fill="x", padx=5, pady=5)
+        self.after(100, lambda: self.chat_container._parent_canvas.yview_moveto(1.0))
+        return msg
 
     def update_ai_bubble(self, msg_obj, text):
         msg_obj.textbox.configure(state="normal")
@@ -133,13 +199,6 @@ class NeptuniumAI(ctk.CTk):
         msg_obj.textbox.insert("0.0", text)
         msg_obj.textbox.configure(state="disabled")
         msg_obj.update_height()
-
-    def refresh_models(self):
-        files = [f for f in os.listdir(".") if f.endswith(".gguf")]
-        if files:
-            self.model_dropdown.configure(values=files)
-            self.model_dropdown.set(files[0])
-            self.switch_model(files[0])
 
 if __name__ == "__main__":
     app = NeptuniumAI()
